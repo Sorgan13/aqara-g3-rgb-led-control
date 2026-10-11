@@ -1,0 +1,157 @@
+#!/bin/sh
+# Aqara Camera Hub G3 status LED controller v1.1.0
+# The native on/off helper is bundled as bin/g3-ledctl-armv7.
+# G3 status indicator: GPIO 49=red, 6=green, 48=blue (active-low).
+# No daemon, no firmware modification, no PWM. Tested on one G3.
+set -eu
+
+GPIO_DIR=${G3_GPIO_DIR:-/sys/class/gpio}
+GPIO_DEBUG=${G3_GPIO_DEBUG:-/sys/kernel/debug/gpio}
+RED="$GPIO_DIR/gpio49/value"
+GREEN="$GPIO_DIR/gpio6/value"
+BLUE="$GPIO_DIR/gpio48/value"
+AGENT=${G3_LEDCTL:-/data/bin/g3-ledctl}
+TOKEN_FILE=${G3_TOKEN_FILE:-/tmp/g3-light.latest}
+
+usage() {
+  cat <<'HELP'
+Aqara Camera Hub G3 — LED RGB controller v1.1.0
+Usage: /data/bin/g3-light COMMAND [SECONDS]
+
+  on      Native indicator ON, blue     off     Native indicator OFF
+  red     Red                           green   Green
+  blue    Blue                          yellow  Red + green
+  cyan    Green + blue                  magenta Red + blue
+  white   Red + green + blue            status  Current states
+  help    Show this help
+
+SECONDS: optional 1..60 for any color; after delay the previous GPIO
+state is restored (or native OFF if the indicator was initially off).
+Without SECONDS the color remains until firmware or another command
+changes the GPIO pins. It is NOT continuously forced.
+HELP
+}
+
+fail() { echo "g3-light: $*" >&2; exit 1; }
+getprop() {
+  if command -v agetprop >/dev/null 2>&1; then
+    agetprop "$1" 2>/dev/null || true
+  fi
+}
+
+# Validate the *actual kernel GPIO labels*. On other models or boards,
+# writing to GPIO 6/48/49 could affect unrelated electronics.
+check_gpio() {
+  [ -r "$GPIO_DEBUG" ] || fail "Cannot read $GPIO_DEBUG; GPIO mapping cannot be verified"
+  grep -Eq 'gpio-6[[:space:]]+[(].*[|]green-gpio[[:space:]]' "$GPIO_DEBUG" || fail 'GPIO6 is not labelled green-gpio'
+  grep -Eq 'gpio-48[[:space:]]+[(].*[|]blue-gpio[[:space:]]' "$GPIO_DEBUG" || fail 'GPIO48 is not labelled blue-gpio'
+  grep -Eq 'gpio-49[[:space:]]+[(].*[|]red-gpio[[:space:]]' "$GPIO_DEBUG" || fail 'GPIO49 is not labelled red-gpio'
+  for f in "$RED" "$GREEN" "$BLUE"; do
+    [ -r "$f" ] && [ -w "$f" ] || fail "Cannot read/write $f (must run as root on G3)"
+  done
+}
+
+get_did() {
+  if [ -n "${G3_DID:-}" ]; then printf '%s\n' "$G3_DID"; else getprop persist.sys.did; fi
+}
+
+native_cmd() {
+  [ -x "$AGENT" ] || fail "Native helper not found: $AGENT"
+  did=$(get_did)
+  case "$did" in lumi1.*) : ;; *) fail 'Cannot determine camera DID (persist.sys.did)' ;; esac
+  "$AGENT" "$1" "$did" || fail "Native LED $1 failed"
+}
+
+# GPIO outputs are active-low. Briefly disable all three before setting
+# the requested combination to prevent unintended transient colors.
+set_channels() {
+  printf '1\n' > "$RED" || fail 'Cannot write red GPIO'
+  printf '1\n' > "$GREEN" || fail 'Cannot write green GPIO'
+  printf '1\n' > "$BLUE" || fail 'Cannot write blue GPIO'
+  printf '%s\n' "$1" > "$RED" || fail 'Cannot write red GPIO'
+  printf '%s\n' "$2" > "$GREEN" || fail 'Cannot write green GPIO'
+  printf '%s\n' "$3" > "$BLUE" || fail 'Cannot write blue GPIO'
+}
+
+# A newer invocation supersedes any ongoing timed color command.
+new_token() {
+  tmp="$TOKEN_FILE.$$"
+  printf '%s\n' "$$" > "$tmp" || fail "Cannot write $tmp"
+  mv -f "$tmp" "$TOKEN_FILE" || fail "Cannot update $TOKEN_FILE"
+}
+is_current_token() { [ -r "$TOKEN_FILE" ] && [ "$(cat "$TOKEN_FILE" 2>/dev/null)" = "$$" ]; }
+
+cmd=${1:-help}
+case "$cmd" in
+  help|-h|--help) [ "$#" -le 1 ] || fail 'Unexpected arguments'; usage; exit 0 ;;
+  status)
+    [ "$#" -eq 1 ] || fail 'status takes no arguments'
+    check_gpio
+    echo "GPIO active-low: R=$(cat "$RED") G=$(cat "$GREEN") B=$(cat "$BLUE")"
+    echo "Aqara LED disabled: $(getprop sys.ledoff)"
+    echo "Aqara indicator resource: $(getprop persist.app.nnlight)"
+    echo "Current camera state: $(getprop sys.current_state)"
+    exit 0 ;;
+  on|off)
+    [ "$#" -eq 1 ] || fail "$cmd takes no arguments"
+    check_gpio
+    new_token
+    native_cmd "$cmd"
+    if [ "$cmd" = on ]; then
+      set_channels 1 1 0
+      echo 'g3-light: native indicator on (blue)'
+    else
+      set_channels 1 1 1
+      echo 'g3-light: native indicator off'
+    fi
+    exit 0 ;;
+  red)     r=0; g=1; b=1 ;;
+  green)   r=1; g=0; b=1 ;;
+  blue)    r=1; g=1; b=0 ;;
+  yellow)  r=0; g=0; b=1 ;;
+  cyan)    r=1; g=0; b=0 ;;
+  magenta) r=0; g=1; b=0 ;;
+  white)   r=0; g=0; b=0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+[ "$#" -le 2 ] || fail 'Too many arguments'
+seconds=${2:-}
+if [ -n "$seconds" ]; then
+  case "$seconds" in *[!0-9]*|'') fail 'SECONDS must be a number 1..60' ;; esac
+  [ "$seconds" -ge 1 ] && [ "$seconds" -le 60 ] || fail 'SECONDS must be 1..60'
+fi
+
+check_gpio
+[ -x "$AGENT" ] || fail "Native helper not found: $AGENT"
+old_r=$(cat "$RED")
+old_g=$(cat "$GREEN")
+old_b=$(cat "$BLUE")
+old_off=$(getprop sys.ledoff)
+new_token
+
+if [ "$old_off" = true ]; then native_cmd on; fi
+set_channels "$r" "$g" "$b"
+echo "g3-light: $cmd${seconds:+ for $seconds seconds}"
+
+restore_previous() {
+  if is_current_token; then
+    if [ "$old_off" = true ]; then
+      native_cmd off
+      set_channels 1 1 1
+    else
+      set_channels "$old_r" "$old_g" "$old_b"
+    fi
+    echo 'g3-light: previous LED state restored'
+  else
+    echo 'g3-light: newer command detected, not restoring'
+  fi
+}
+if [ -n "$seconds" ]; then
+  trap 'restore_previous; exit 130' INT
+  trap 'restore_previous; exit 143' TERM
+  trap 'restore_previous; exit 129' HUP
+  sleep "$seconds" || true
+  trap - INT TERM HUP
+  restore_previous
+fi
